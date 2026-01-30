@@ -1,0 +1,134 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===================================
+    //  Yardımcı Fonksiyonlar
+    // ===================================
+
+    // Kullanıcının oturum açıp açmadığını kontrol eder.
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // İsteği yapan kullanıcının, belirtilen userId ile aynı olup olmadığını kontrol eder.
+    function isUser(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Firestore'dan bir okuma yaparak kullanıcının 'admin' rolüne sahip olup olmadığını kontrol eder.
+    function isAdmin() {
+      return isSignedIn() && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+    
+    // Kullanıcının takım görevlerini yönetme yetkisi olup olmadığını kontrol eder.
+    // Bu, adminleri veya 'canViewTeamTasks' iznine sahip kullanıcıları içerir.
+    function isTeamLead() {
+        return isAdmin() || (
+            exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+            get(/databases/$(database)/documents/users/$(request.auth.uid)).data.canViewTeamTasks == true
+        );
+    }
+
+    // İsteği yapan kullanıcının görevi oluşturan kişi olup olmadığını kontrol eder.
+    function isCreator(taskId) {
+      // Önce görevin var olup olmadığını kontrol et
+      return isSignedIn() &&
+             exists(/databases/$(database)/documents/tasks/$(taskId)) &&
+             request.auth.uid == get(/databases/$(database)/documents/tasks/$(taskId)).data.creatorId;
+    }
+    
+    // İsteği yapan kullanıcının göreve atanmış olup olmadığını kontrol eder.
+    function isAssigned(taskId) {
+      // Önce görevin var olup olmadığını kontrol et
+      return isSignedIn() && 
+             exists(/databases/$(database)/documents/tasks/$(taskId)) &&
+             request.auth.uid in get(/databases/$(database)/documents/tasks/$(taskId)).data.userIds;
+    }
+    
+    // --- Güvenli Atama Değişikliği Fonksiyonları ---
+
+    // Normal bir kullanıcının görev atamalarını yönetip yönetemeyeceğini kontrol eder.
+    // Bu fonksiyon, bir kullanıcının yalnızca başkalarını kaldırmamasını ve
+    // son kişi olarak kendini kaldırmamasını sağlar, ancak yeni kişiler eklemesine izin verir.
+    function userManagesOwnAssignment(currentIds, newIds) {
+      // Diğer kullanıcıların korunup korunmadığını kontrol et.
+      // Yeni liste, istek yapan kullanıcı hariç mevcut tüm kullanıcıları içermelidir.
+      let otherUsers = currentIds.removeAll([request.auth.uid]);
+      let otherUsersWerePreserved = newIds.hasAll(otherUsers);
+
+      // Kullanıcının, görevdeki son kişi değilse kendini kaldırabileceğinden emin ol.
+      let selfRemovalIsSafe = currentIds.size() > 1 || newIds.has(request.auth.uid);
+      
+      return otherUsersWerePreserved && selfRemovalIsSafe;
+    }
+
+    // ===================================
+    //  Koleksiyon Kuralları
+    // ===================================
+
+    // Kullanıcı Profilleri
+    match /users/{userId} {
+      allow get, list: if isSignedIn();
+      allow create, update: if isUser(userId) || isAdmin();
+      allow delete: if isAdmin();
+    }
+    
+    // Görevler Koleksiyonu
+    match /tasks/{taskId} {
+      // Her oturum açmış kullanıcı görevleri okuyabilir. Uygulama katmanı filtreleme yapar.
+      allow read: if isSignedIn();
+      
+      // Her oturum açmış kullanıcı görev oluşturabilir, ancak creatorId kendi ID'si olmalıdır.
+      allow create: if isSignedIn() && request.resource.data.creatorId == request.auth.uid;
+      
+      // Görevi oluşturan veya göreve atanmış olan kullanıcı silebilir.
+      allow delete: if isCreator(taskId) || isAssigned(taskId);
+      
+      // Güncelleme kuralları
+      allow update: if 
+        // Görevi oluşturan kişi veya takım lideri her zaman güncelleyebilir.
+        isCreator(taskId) || isTeamLead() ||
+        
+        // VEYA, göreve atanmış bir kullanıcı belirli koşullar altında güncelleyebilir.
+        (isAssigned(taskId) &&
+          // Atanan kullanıcı 'creatorId'yi asla değiştiremez.
+          request.resource.data.creatorId == resource.data.creatorId &&
+          
+          // Atama listesi (userIds) değiştirilmiyorsa, diğer alanları güncelleyebilir.
+          (request.resource.data.userIds == resource.data.userIds ||
+           
+           // VEYA atama listesi değiştiriliyorsa, yeni kural fonksiyonunu kullan.
+           userManagesOwnAssignment(resource.data.userIds, request.resource.data.userIds)
+          )
+        );
+    }
+
+    // Diğer koleksiyonlar için temel kurallar
+    match /testCases/{testCaseId} {
+      allow read, write: if isSignedIn() && exists(/databases/$(database)/documents/tasks/$(testCaseId)) && (isTeamLead() || request.auth.uid in get(/databases/$(database)/documents/tasks/$(testCaseId)).data.userIds);
+    }
+    
+    match /global_settings/{settingId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+    
+    match /baseLinks/{linkId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /cityAdmins/{cityId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /users/{userId}/settings/{settingId} {
+      allow read, write: if isUser(userId);
+    }
+  }
+}
